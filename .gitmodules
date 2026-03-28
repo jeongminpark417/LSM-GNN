@@ -1,4 +1,4 @@
 [submodule "bam"]
 	path = bam
 	url = https://github.com/ZaidQureshi/bam.git
-	branch = version_update
+	branch = lsm_gnn
