@@ -18,9 +18,23 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD 14)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 70 80)
-endif()
+# BAM atomics / PTX need sm_70+. Pin the module target so stale global arch (e.g. 52) cannot break ptxas.
+set(LSM_CUDA_ARCHITECTURES "70;80" CACHE STRING
+  "CUDA architectures for BAM_Feature_Store (minimum sm_70).")
+foreach(_lsm_a IN LISTS LSM_CUDA_ARCHITECTURES)
+  string(TOLOWER "${_lsm_a}" _lsm_al)
+  if(_lsm_al STREQUAL "native" OR _lsm_al STREQUAL "all" OR _lsm_al STREQUAL "all-major")
+    message(FATAL_ERROR
+      "lsm_module: LSM_CUDA_ARCHITECTURES='${_lsm_a}' is not supported. Use e.g. -DLSM_CUDA_ARCHITECTURES=80")
+  endif()
+  if(_lsm_a MATCHES "^[0-9]+")
+    string(REGEX REPLACE "^([0-9]+).*" "\\1" _lsm_maj "${_lsm_a}")
+    if(_lsm_maj LESS 70)
+      message(FATAL_ERROR
+        "lsm_module: LSM_CUDA_ARCHITECTURES entry '${_lsm_a}' is below minimum sm_70.")
+    endif()
+  endif()
+endforeach()
 
 find_package(Python3 3.8
   REQUIRED COMPONENTS Interpreter Development.Module
@@ -56,6 +70,9 @@ find_package(OpenMP)
 set(LSM_GNN_BAM_ROOT "${CMAKE_CURRENT_LIST_DIR}/../bam" CACHE PATH
   "BAM tree (headers under include/, libnvm under build/)")
 
+# Do not use find_library(NVM_LIBRARY ...) when NVM_LIBRARY is a cached empty
+# string: CMake treats that as "already set" and skips the search. Use a
+# scratch variable, then publish the result to NVM_LIBRARY.
 set(NVM_LIBRARY "" CACHE FILEPATH
   "Optional path to libnvm.so; if empty, search under LSM_GNN_BAM_ROOT")
 
@@ -64,17 +81,24 @@ if(NVM_LIBRARY)
     message(FATAL_ERROR "NVM_LIBRARY is not a file: \"${NVM_LIBRARY}\"")
   endif()
 else()
-  find_library(NVM_LIBRARY
-    NAMES nvm libnvm.so
+  find_library(_lsm_nvm_lib
+    NAMES nvm
     PATHS
       "${LSM_GNN_BAM_ROOT}/build/lib"
       "${LSM_GNN_BAM_ROOT}/build/module"
     NO_DEFAULT_PATH)
-  if(NOT NVM_LIBRARY)
+  if(NOT _lsm_nvm_lib)
     message(FATAL_ERROR
-      "libnvm not found under \"${LSM_GNN_BAM_ROOT}\". "
-      "Build BAM or set NVM_LIBRARY / LSM_GNN_BAM_ROOT.")
+      "libnvm not found under \"${LSM_GNN_BAM_ROOT}\".\n"
+      "Build the BAM userspace library (produces build/lib/libnvm.so), for example:\n"
+      "  cmake -S \"${LSM_GNN_BAM_ROOT}\" -B \"${LSM_GNN_BAM_ROOT}/build\"\n"
+      "  cmake --build \"${LSM_GNN_BAM_ROOT}/build\" -j --target libnvm\n"
+      "Then re-run cmake, or pass the library explicitly:\n"
+      "  cmake .. -DNVM_LIBRARY=\"${LSM_GNN_BAM_ROOT}/build/lib/libnvm.so\"\n"
+      "If bam lives elsewhere: -DLSM_GNN_BAM_ROOT=/path/to/bam")
   endif()
+  set(NVM_LIBRARY "${_lsm_nvm_lib}" CACHE FILEPATH
+    "Optional path to libnvm.so; if empty, search under LSM_GNN_BAM_ROOT" FORCE)
 endif()
 mark_as_advanced(NVM_LIBRARY)
 
@@ -102,7 +126,10 @@ target_compile_options(BAM_Feature_Store PRIVATE
 
 set_target_properties(BAM_Feature_Store PROPERTIES
   PREFIX ""
-  LIBRARY_OUTPUT_DIRECTORY "${_lsm_py_pkg}")
+  LIBRARY_OUTPUT_DIRECTORY "${_lsm_py_pkg}"
+  CUDA_ARCHITECTURES "${LSM_CUDA_ARCHITECTURES}")
+
+message(STATUS "lsm_module: CUDA_ARCHITECTURES (target) ${LSM_CUDA_ARCHITECTURES}")
 
 configure_file(
   "${CMAKE_CURRENT_LIST_DIR}/python/BAM_Feature_Store/__init__.py"

@@ -121,7 +121,10 @@ uint64_t* device_meta;
   void print();
   int add(int a, int b);
 
-  void init_controllers(int ps, uint64_t r_off, uint64_t num_ele, uint64_t cache_size,uint64_t num_ssd, uint32_t wb_size, uint64_t q_size, bool f, int32_t cpu_agg_q_depth);
+  void init_controllers(int ps, uint64_t read_off, uint64_t cache_size,
+                        uint64_t num_ele, uint64_t num_ssd, uint32_t wb_size,
+                        uint64_t wb_queue_size, bool cpu_agg,
+                        int32_t cpu_agg_q_depth);
   void mgc_init_controllers(int ps, uint64_t r_off, uint64_t num_ele, uint64_t cache_size,uint64_t ctrl_idx, bool cpu_cache, uint64_t cpu_cache_ptr);
 
   void read_feature_test();
