@@ -4,7 +4,7 @@
 #define TYPE float
 
 struct BAM_Feature_Store {
-  const char *const ctrls_paths[5] = {"/dev/libnvm1","/dev/libnvm0","/dev/libnvm2","/dev/libnvm3","/dev/libnvm4"};
+  const char *const ctrls_paths[5] = {"/dev/libnvm0","/dev/libnvm1","/dev/libnvm2","/dev/libnvm3","/dev/libnvm4"};
 
   cudaStream_t stream_array[8];
   cudaStream_t transfer_stream;

@@ -165,6 +165,32 @@ class IGB260M(object):
             return np.load(path, mmap_mode="r")
 
 
+def _numpy_writable_copy(arr: np.ndarray) -> np.ndarray:
+    """mmap / read-only arrays trigger PyTorch warnings and unsafe writes."""
+    a = np.asarray(arr)
+    if not a.flags.writeable:
+        return a.copy()
+    return a
+
+
+def _remove_self_loops_compat(edge_index: torch.Tensor, num_nodes: int):
+    from torch_geometric.utils import remove_self_loops
+
+    try:
+        return remove_self_loops(edge_index, num_nodes=num_nodes)
+    except TypeError:
+        return remove_self_loops(edge_index)
+
+
+def _add_self_loops_compat(edge_index: torch.Tensor, num_nodes: int):
+    from torch_geometric.utils import add_self_loops
+
+    try:
+        return add_self_loops(edge_index, num_nodes=num_nodes)
+    except TypeError:
+        return add_self_loops(edge_index)
+
+
 def csc_npy_to_edge_index(
     edge_col_idx: torch.Tensor,
     edge_row_idx: torch.Tensor,
@@ -231,7 +257,6 @@ class SimpleIGBArgs:
 def build_homogeneous_pyg_data(args: Any) -> "torch_geometric.data.Data":
     """IGB or OGB homogeneous graph as PyG ``Data`` (mirrors IGB260MDGLDataset / OGBDGLDataset)."""
     from torch_geometric.data import Data
-    from torch_geometric.utils import add_self_loops, remove_self_loops
 
     dataset = IGB260M(
         root=args.path,
@@ -244,9 +269,9 @@ def build_homogeneous_pyg_data(args: Any) -> "torch_geometric.data.Data":
         data=args.data,
     )
 
-    x = torch.from_numpy(dataset.paper_feat).float()
-    node_labels = torch.from_numpy(dataset.paper_label).long()
-    node_edges = torch.from_numpy(dataset.paper_edge)
+    x = torch.from_numpy(_numpy_writable_copy(dataset.paper_feat)).float()
+    node_labels = torch.from_numpy(_numpy_writable_copy(dataset.paper_label)).long()
+    node_edges = torch.from_numpy(_numpy_writable_copy(dataset.paper_edge))
 
     if getattr(args, "data", "IGB") == "OGB":
         edge_index = torch.stack([node_edges[0, :], node_edges[1, :]], dim=0).long()
@@ -271,8 +296,9 @@ def build_homogeneous_pyg_data(args: Any) -> "torch_geometric.data.Data":
         edge_index = torch.stack([node_edges[:, 0], node_edges[:, 1]], dim=0).long()
 
     if args.dataset_size != "full":
-        edge_index, _ = remove_self_loops(edge_index, num_nodes=x.size(0))
-        edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+        n = int(x.size(0))
+        edge_index, _ = _remove_self_loops_compat(edge_index, n)
+        edge_index, _ = _add_self_loops_compat(edge_index, n)
 
     train_mask, val_mask, test_mask = _homogeneous_masks(
         args.dataset_size, args.num_classes, x.size(0)

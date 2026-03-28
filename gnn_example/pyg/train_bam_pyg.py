@@ -26,7 +26,10 @@ missing, or use::
 
     python train_bam_pyg.py --epochs 2 --num-nodes 5000 --bam 0 --full-batch
 
-Synthetic demo (no NVMe)::
+By default the script **exits with an error** if CUDA is unavailable. For a tiny
+CPU-only smoke test, add ``--allow-cpu``.
+
+Synthetic demo (no NVMe; needs GPU or add ``--allow-cpu``)::
 
     python train_bam_pyg.py --epochs 2 --num-nodes 5000 --bam 0
 
@@ -91,6 +94,19 @@ def _pyg_wheel_index_url() -> str:
     else:
         suffix = f"{tv}+cpu"
     return f"https://data.pyg.org/whl/torch-{suffix}.html"
+
+
+def build_adam_optimizer(parameters, lr: float, weight_decay: float):
+    """
+    Prefer foreach=False: multi-tensor Adam can surface cudaErrorUnknown on some
+    driver/GPU stacks while the real fault was earlier (async CUDA).
+    """
+    try:
+        return torch.optim.Adam(
+            parameters, lr=lr, weight_decay=weight_decay, foreach=False
+        )
+    except TypeError:
+        return torch.optim.Adam(parameters, lr=lr, weight_decay=weight_decay)
 
 
 def _make_synthetic_data(num_nodes: int, feat_dim: int, num_classes: int, seed: int):
@@ -246,13 +262,31 @@ def main():
         action="store_true",
         help="Train on the full graph (no NeighborLoader; no pyg-lib/torch-sparse).",
     )
+    parser.add_argument(
+        "--allow-cpu",
+        action="store_true",
+        help="Allow CPU-only run if CUDA is unavailable (default: exit with error).",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
-    if args.bam and not torch.cuda.is_available():
+    cuda_ok = torch.cuda.is_available()
+    if args.bam and not cuda_ok:
         print("error: --bam 1 requires CUDA (GIDS uses GPU tensors).", file=sys.stderr)
         sys.exit(1)
-    device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
+    if not cuda_ok and not args.allow_cpu:
+        print(
+            "error: CUDA is not available; refusing to run on CPU.\n"
+            "  Fix the GPU driver / busy GPU (avoid sudo; check nvidia-smi), or pass --allow-cpu "
+            "for a small CPU-only smoke test.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    device = torch.device(f"cuda:{args.device}" if cuda_ok else "cpu")
+    print(
+        f"torch.cuda.is_available()={cuda_ok}  ->  using device: {device}",
+        flush=True,
+    )
 
     try:
         from torch_geometric.loader import NeighborLoader
@@ -343,7 +377,7 @@ def main():
         args.num_classes,
         num_layers=args.num_layers,
     ).to(device)
-    optimizer = torch.optim.Adam(
+    optimizer = build_adam_optimizer(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 

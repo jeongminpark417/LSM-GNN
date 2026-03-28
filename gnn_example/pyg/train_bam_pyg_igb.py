@@ -19,6 +19,13 @@ With BAM (match ``num_ele`` / cache to your NVMe layout; see ``gids_training.py`
 
     export LD_LIBRARY_PATH=/path/to/bam/build/lib:$LD_LIBRARY_PATH
     python train_bam_pyg_igb.py --bam 1 --data IGB --dataset_size full ...
+
+If you see ``CUDA error: unknown error`` during ``optimizer.step()``, try (1) avoid
+``sudo`` for training, (2) ``CUDA_LAUNCH_BLOCKING=1`` to pin the real failing op,
+(3) smaller ``--batch-size``. This repo uses ``Adam(..., foreach=False)`` to avoid
+a common multi-tensor Adam + driver quirk.
+
+Without a working GPU the script **exits** unless you pass ``--allow-cpu``.
 """
 
 from __future__ import annotations
@@ -48,6 +55,7 @@ from train_bam_pyg import (
     _neighbor_sampler_backend_ok,
     _prepend_path,
     _pyg_wheel_index_url,
+    build_adam_optimizer,
     eval_epoch,
     eval_fullbatch,
     train_epoch,
@@ -124,6 +132,11 @@ def main():
         action="store_true",
         help="Full-graph training (no NeighborLoader / pyg-lib)",
     )
+    parser.add_argument(
+        "--allow-cpu",
+        action="store_true",
+        help="Allow CPU if CUDA is unavailable (default: exit with error).",
+    )
     args = parser.parse_args()
 
     if args.num_ele is None:
@@ -133,10 +146,22 @@ def main():
             args.num_ele = 111059956 * 128 * 2
 
     torch.manual_seed(args.seed)
-    if args.bam and not torch.cuda.is_available():
+    cuda_ok = torch.cuda.is_available()
+    if args.bam and not cuda_ok:
         print("error: --bam 1 requires CUDA.", file=sys.stderr)
         sys.exit(1)
-    device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
+    if not cuda_ok and not args.allow_cpu:
+        print(
+            "error: CUDA is not available; refusing to run on CPU.\n"
+            "  Fix the GPU (avoid sudo; nvidia-smi; error 46 = busy/unavailable), or pass --allow-cpu.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    device = torch.device(f"cuda:{args.device}" if cuda_ok else "cpu")
+    print(
+        f"torch.cuda.is_available()={cuda_ok}  ->  using device: {device}",
+        flush=True,
+    )
 
     try:
         from torch_geometric.loader import NeighborLoader
@@ -153,8 +178,24 @@ def main():
         flush=True,
     )
 
-    feat_dim = args.feat_dim if args.feat_dim is not None else int(data.x.size(1))
+    ei_max = int(data.edge_index.max().item())
+    if ei_max >= data.num_nodes:
+        print(
+            f"error: edge_index references node id {ei_max} but num_nodes={data.num_nodes}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     num_classes = int(args.num_classes)
+    y_min = int(data.y.min().item())
+    y_max = int(data.y.max().item())
+    if y_min < 0 or y_max >= num_classes:
+        print(
+            f"error: labels out of range for num_classes={num_classes} (min={y_min}, max={y_max})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    feat_dim = args.feat_dim if args.feat_dim is not None else int(data.x.size(1))
 
     train_loader = val_loader = test_loader = None
     if args.full_batch:
@@ -231,7 +272,7 @@ def main():
         num_classes,
         num_layers=args.num_layers,
     ).to(device)
-    optimizer = torch.optim.Adam(
+    optimizer = build_adam_optimizer(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 
