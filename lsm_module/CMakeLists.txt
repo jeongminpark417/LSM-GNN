@@ -1,7 +1,7 @@
 # lsm_module — PyBind11 + CUDA extension (BAM NVMe feature store)
 #
 #   include/lsm_module/   API headers + device shims
-#   src/                  gids_nvme.cu
+#   src/                  gids_nvme.cu, lsm_nvme.cu
 #   python/BAM_Feature_Store/  templates → ${CMAKE_CURRENT_BINARY_DIR}/BAM_Feature_Store/
 
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
@@ -106,6 +106,7 @@ message(STATUS "lsm_module: BAM root  ${LSM_GNN_BAM_ROOT}")
 message(STATUS "lsm_module: libnvm    ${NVM_LIBRARY}")
 
 set(_lsm_py_pkg "${CMAKE_CURRENT_BINARY_DIR}/BAM_Feature_Store")
+set(_lsm_nvme_pkg "${CMAKE_CURRENT_BINARY_DIR}/LSM_NVMe")
 
 pybind11_add_module(BAM_Feature_Store MODULE src/gids_nvme.cu)
 
@@ -129,6 +130,24 @@ set_target_properties(BAM_Feature_Store PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${_lsm_py_pkg}"
   CUDA_ARCHITECTURES "${LSM_CUDA_ARCHITECTURES}")
 
+pybind11_add_module(LSM_NVMe MODULE src/lsm_nvme.cu)
+
+target_include_directories(LSM_NVMe
+  PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/include"
+    "${LSM_GNN_BAM_ROOT}/include"
+    "${LSM_GNN_BAM_ROOT}/include/freestanding/include")
+
+target_link_libraries(LSM_NVMe PRIVATE "${NVM_LIBRARY}")
+
+target_compile_options(LSM_NVMe PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
+
+set_target_properties(LSM_NVMe PROPERTIES
+  PREFIX ""
+  LIBRARY_OUTPUT_DIRECTORY "${_lsm_nvme_pkg}"
+  CUDA_ARCHITECTURES "${LSM_CUDA_ARCHITECTURES}")
+
 message(STATUS "lsm_module: CUDA_ARCHITECTURES (target) ${LSM_CUDA_ARCHITECTURES}")
 
 configure_file(
@@ -141,9 +160,26 @@ configure_file(
   "${_lsm_py_pkg}/setup.py"
   @ONLY)
 
+configure_file(
+  "${CMAKE_CURRENT_LIST_DIR}/python/LSM_NVMe/__init__.py"
+  "${_lsm_nvme_pkg}/__init__.py"
+  COPYONLY)
+
+configure_file(
+  "${CMAKE_CURRENT_LIST_DIR}/python/LSM_NVMe/setup.py.in"
+  "${_lsm_nvme_pkg}/setup.py"
+  @ONLY)
+
 install(TARGETS BAM_Feature_Store
   LIBRARY DESTINATION "${_lsm_python_platlib}/BAM_Feature_Store"
   COMPONENT python)
 install(FILES "${_lsm_py_pkg}/__init__.py"
   DESTINATION "${_lsm_python_platlib}/BAM_Feature_Store"
+  COMPONENT python)
+
+install(TARGETS LSM_NVMe
+  LIBRARY DESTINATION "${_lsm_python_platlib}/LSM_NVMe"
+  COMPONENT python)
+install(FILES "${_lsm_nvme_pkg}/__init__.py"
+  DESTINATION "${_lsm_python_platlib}/LSM_NVMe"
   COMPONENT python)

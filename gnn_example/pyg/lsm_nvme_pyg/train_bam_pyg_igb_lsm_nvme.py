@@ -1,41 +1,17 @@
 #!/usr/bin/env python3
 """
-PyG training on **IGB / OGB** homogeneous graphs (``dataloader_pyg.build_homogeneous_pyg_data``).
+PyG training on **IGB / OGB** homogeneous graphs using **LSM_NVMe** (no GIDS).
 
-Same training loop and optional **GIDS/BAM** path as ``train_bam_pyg.py``, but the
-graph comes from the same file layout as ``gnn_example/dataloader.py`` /
-``gids_training.py``. Neighbor sampling **always** uses
-``lsm_gnn_neighbor_loader.LSM_GNN_Neighbor_Loader`` (subclass of PyG
-``NeighborLoader``), not plain ``NeighborLoader``.
+Same layout as ``../train_bam_pyg_igb.py``, but features come from
+:class:`lsm_nvme_client.LSM_NVMeFeatureClient` and neighbor sampling uses
+``lsm_nvme_pyg.neighbor_loader_lsm_nvme.LSM_GNN_Neighbor_Loader`` with
+``lsm_nvme=`` kwargs.
 
-Example (small IGB partition, neighbor sampling)::
+Example::
 
-    python train_bam_pyg_igb.py --path /data/IGB260M --dataset_size small \\
-        --data IGB --num_classes 19 --epochs 2 --batch-size 1024
-
-Full graph on one GPU (only for small graphs; needs pyg-lib unless --full-batch)::
-
-    python train_bam_pyg_igb.py ... --full-batch
-
-With BAM (match ``num_ele`` / cache to your NVMe layout; see ``gids_training.py``)::
-
-    export LD_LIBRARY_PATH=/path/to/bam/build/lib:$LD_LIBRARY_PATH
-    python train_bam_pyg_igb.py --bam 1 --data IGB --dataset_size full ...
-
-With ``--bam 1``, the graph is replaced by a **slim** ``Data`` (``x`` has 0 columns)
-so ``NeighborLoader`` does not gather or H2D-copy full embeddings; features come
-only from ``GIDS.fetch_feature`` (NVMe) inside ``LSM_GNN_Neighbor_Loader.filter_fn``
-(slim ``filter_data`` + GIDS, no dense ``data.x`` gather).
-
-By default, ``--max-batches 2`` limits each train/val/test pass to two mini-batches
-per epoch for quick tests; use ``--max-batches 0`` for a full epoch over each loader.
-
-If you see ``CUDA error: unknown error`` during ``optimizer.step()``, try (1) avoid
-``sudo`` for training, (2) ``CUDA_LAUNCH_BLOCKING=1`` to pin the real failing op,
-(3) smaller ``--batch-size``. This repo uses ``Adam(..., foreach=False)`` to avoid
-a common multi-tensor Adam + driver quirk.
-
-Without a working GPU the script **exits** unless you pass ``--allow-cpu``.
+    export LD_LIBRARY_PATH=/path/to/LSM-GNN/bam/build/lib:$LD_LIBRARY_PATH
+    python train_bam_pyg_igb_lsm_nvme.py --bam 1 --data IGB --dataset_size small ...
+    python train_bam_pyg_igb_lsm_nvme.py --bam 1 --pvp ...   # PVP path + batch prefetch (see --pvp-num-buffers)
 """
 
 from __future__ import annotations
@@ -57,16 +33,23 @@ except ImportError:
     sys.exit(1)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_PARENT = os.path.normpath(os.path.join(_HERE, ".."))
+_REPO_ROOT = os.path.normpath(os.path.join(_HERE, "..", "..", ".."))
+# ../pyg has dataloader_pyg, train_bam_pyg, and a *different* lsm_gnn_neighbor_loader (gids=).
+# This directory must be ahead of _PARENT so `lsm_gnn_neighbor_loader` is the NVMe copy.
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+else:
+    try:
+        sys.path.remove(_HERE)
+    except ValueError:
+        pass
+    sys.path.insert(0, _HERE)
+if _PARENT not in sys.path:
+    sys.path.append(_PARENT)
 
 from dataloader_pyg import build_homogeneous_pyg_data
 from pyg_loader_skip_features import data_without_dense_node_features
-
-try:
-    from lsm_gnn_neighbor_loader import LSM_GNN_Neighbor_Loader
-except ImportError:
-    LSM_GNN_Neighbor_Loader = None  # type: ignore[misc, assignment]
 from train_bam_pyg import (
     _neighbor_sampler_backend_ok,
     _prepend_path,
@@ -79,7 +62,8 @@ from train_bam_pyg import (
     train_epoch_fullbatch,
 )
 
-_REPO_ROOT = os.path.normpath(os.path.join(_HERE, "..", ".."))
+from neighbor_loader_lsm_nvme import LSM_GNN_Neighbor_Loader
+from lsm_nvme_client import LSM_NVMeFeatureClient
 
 
 def make_igb_neighbor_loaders(
@@ -88,9 +72,7 @@ def make_igb_neighbor_loaders(
     batch_size: int,
     bam_loader_kw: dict,
 ):
-    """Train/val/test :class:`lsm_gnn_neighbor_loader.LSM_GNN_Neighbor_Loader` instances."""
-    if LSM_GNN_Neighbor_Loader is None:
-        raise RuntimeError("LSM_GNN_Neighbor_Loader unavailable (install torch-geometric)")
+    """Train/val/test :class:`LSM_GNN_Neighbor_Loader` instances (LSM_NVMe aliases)."""
     common = {
         "num_neighbors": num_neighbors,
         "batch_size": batch_size,
@@ -120,9 +102,8 @@ def make_igb_neighbor_loaders(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PyG GraphSAGE on IGB/OGB (homogeneous) + optional GIDS/BAM"
+        description="PyG GraphSAGE on IGB/OGB + optional LSM_NVMe (no GIDS)"
     )
-    # Dataset (aligned with gids_training.py)
     parser.add_argument(
         "--path",
         type=str,
@@ -149,17 +130,18 @@ def main():
         "--lsm-build",
         type=str,
         default=None,
-        help="lsm_module CMake build dir (BAM_Feature_Store)",
+        help="lsm_module CMake build dir (must contain LSM_NVMe/)",
     )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument(
         "--max-batches",
         type=int,
-        default=2,
+        default=None,
+        metavar="N",
         help=(
-            "Cap train/val/test to this many mini-batches per epoch (default 2 for quick tests). "
-            "Use 0 for a full pass over each loader."
+            "Cap train/val/test to N mini-batches per epoch (smoke/debug). "
+            "Omit for a full pass each epoch; use 0 for full pass if passed explicitly."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=1024)
@@ -170,24 +152,31 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--bam", type=int, default=0, choices=[0, 1])
+    parser.add_argument(
+        "--pvp",
+        action="store_true",
+        help="Enable LSM_NVMe PVP (is_pvp) and neighbor-loader batch prefetch queue (requires --bam 1).",
+    )
+    parser.add_argument(
+        "--pvp-num-buffers",
+        type=int,
+        default=64,
+        help="PVP device num_pvp_buffers / queue depth and loader lookahead depth (default 64).",
+    )
     parser.add_argument("--num-ssd", type=int, default=1)
     parser.add_argument("--cache-size", type=int, default=10)
     parser.add_argument(
         "--num-ele",
         type=int,
         default=None,
-        help="BAM backing-store element count (default: IGB/OGB presets like gids_training)",
+        help="BAM backing-store element count (default: IGB/OGB presets)",
     )
-    parser.add_argument("--wb-size", type=int, default=8)
-    parser.add_argument("--wb-queue-size", type=int, default=131072)
-    parser.add_argument("--cpu-agg", action="store_true")
-    parser.add_argument("--cpu-agg-q-depth", type=int, default=0)
     parser.add_argument("--page-size", type=int, default=4096)
     parser.add_argument(
         "--feat-dim",
         type=int,
         default=None,
-        help="Override input dim for model/BAM (default: data.x.size(1))",
+        help="Override input dim for model (default: data.x.size(1))",
     )
     parser.add_argument(
         "--full-batch",
@@ -201,7 +190,17 @@ def main():
     )
     args = parser.parse_args()
 
-    max_batches = None if args.max_batches <= 0 else int(args.max_batches)
+    if args.pvp and not args.bam:
+        print("error: --pvp requires --bam 1 (LSM_NVMe PVP path).", file=sys.stderr)
+        sys.exit(1)
+    if args.pvp_num_buffers <= 0:
+        print("error: --pvp-num-buffers must be positive.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.max_batches is None or int(args.max_batches) <= 0:
+        max_batches = None
+    else:
+        max_batches = int(args.max_batches)
 
     if args.num_ele is None:
         if args.data == "IGB":
@@ -217,7 +216,7 @@ def main():
     if not cuda_ok and not args.allow_cpu:
         print(
             "error: CUDA is not available; refusing to run on CPU.\n"
-            "  Fix the GPU (avoid sudo; nvidia-smi; error 46 = busy/unavailable), or pass --allow-cpu.",
+            "  Pass --allow-cpu to override.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -258,37 +257,40 @@ def main():
     if args.bam:
         data = data_without_dense_node_features(data)
         print(
-            f"Slim BAM Data: x shape {tuple(data.x.shape)} (features via GIDS only; "
+            f"Slim BAM Data: x shape {tuple(data.x.shape)} (features via LSM_NVMe only; "
             "no full-dim loader collation/H2D)",
             flush=True,
         )
 
     gids = None
     if args.bam:
-        # Match gids_training.py: OGB uses page_size 128*4 (512) for float32 dim-128 rows.
         if args.data == "OGB" and args.page_size == 4096:
             args.page_size = 128 * 4
         lsm_build = args.lsm_build or os.path.join(args.repo_root, "lsm_module", "build")
-        gids_setup = os.path.join(args.repo_root, "LSM_GNN_Setup")
-        _prepend_path(lsm_build)
-        _prepend_path(gids_setup)
-        import GIDS  # noqa: E402
-
-        gids = GIDS.GIDS(
+        nvme_pkg = os.path.join(lsm_build, "LSM_NVMe")
+        _prepend_path(nvme_pkg)
+        nb = int(args.pvp_num_buffers)
+        gids = LSM_NVMeFeatureClient(
             page_size=args.page_size,
             off=0,
             cache_dim=feat_dim,
             num_ele=args.num_ele,
             num_ssd=args.num_ssd,
             cache_size=args.cache_size,
-            wb_size=args.wb_size,
-            wb_queue_size=args.wb_queue_size,
-            cpu_agg=args.cpu_agg,
-            cpu_agg_queue_size=args.cpu_agg_q_depth,
             ctrl_idx=args.device,
             no_init=False,
-            ddp=False,
+            lsm_build=lsm_build,
+            repo_root=args.repo_root,
+            is_pvp=bool(args.pvp),
+            num_pvp_buffers=nb if args.pvp else 0,
+            pvp_queue_depth=nb if args.pvp else 0,
         )
+        if args.pvp:
+            print(
+                f"LSM_NVMe PVP: is_pvp=True  num_pvp_buffers=pvp_queue_depth={nb}  "
+                f"page cache --cache-size={args.cache_size} GiB",
+                flush=True,
+            )
 
     train_loader = val_loader = test_loader = None
     bam_feat_stats: dict[str, float | int] | None = None
@@ -305,34 +307,36 @@ def main():
         )
         sys.exit(1)
     else:
-        if LSM_GNN_Neighbor_Loader is None:
-            print(
-                "error: could not import lsm_gnn_neighbor_loader (need torch-geometric).",
-                file=sys.stderr,
-            )
-            sys.exit(1)
         num_neighbors = [int(x) for x in args.num_neighbors.split(",") if x.strip()]
         bam_loader_kw: dict = {}
         if args.bam:
             if gids is None:
-                print("error: --bam 1 but GIDS failed to initialize.", file=sys.stderr)
+                print("error: --bam 1 but LSM_NVMe client failed to initialize.", file=sys.stderr)
                 sys.exit(1)
             bam_feat_stats = {"s": 0.0, "n": 0}
             bam_loader_kw = {
-                "gids": gids,
-                "gids_feat_dim": feat_dim,
-                "gids_device": device,
-                "gids_timing_stats": bam_feat_stats,
+                "lsm_nvme": gids,
+                "lsm_nvme_feat_dim": feat_dim,
+                "lsm_nvme_device": device,
+                "lsm_nvme_timing_stats": bam_feat_stats,
             }
+            if args.pvp:
+                bam_loader_kw["pvp_batch_prefetch"] = True
+                bam_loader_kw["num_pvp_buffers"] = int(args.pvp_num_buffers)
 
         print(
-            "Dataloader: LSM_GNN_Neighbor_Loader (lsm_gnn_neighbor_loader.py).",
+            "Dataloader: LSM_GNN_Neighbor_Loader (lsm_nvme_pyg/neighbor_loader_lsm_nvme.py).",
             flush=True,
         )
+        if args.bam and args.pvp:
+            print(
+                f"NeighborLoader: pvp_batch_prefetch=True  num_pvp_buffers={args.pvp_num_buffers}",
+                flush=True,
+            )
         if max_batches is not None:
             print(
                 f"Limiting train/val/test to {max_batches} batch(es) per epoch "
-                f"(change with --max-batches, or 0 for full epoch).",
+                f"(omit --max-batches for a full epoch).",
                 flush=True,
             )
 
@@ -423,10 +427,20 @@ def main():
             bam_features_from_loader=use_bam,
             max_batches=max_batches,
         )
-    print(f"Test acc {test_acc:.2f}% | test_batches={n_te} | wall {time.time() - t0:.1f}s")
+    wall_s = time.time() - t0
+    print(f"Test acc {test_acc:.2f}% | test_batches={n_te} | wall {wall_s:.1f}s")
     if use_bam:
+        n_ssd = None
+        ps = int(args.page_size)
+        if gids is not None and hasattr(gids, "ssd_read_ops_count"):
+            n_ssd = int(gids.ssd_read_ops_count())
         print_bam_feature_fetch_summary(
-            total_feat_fetch_s, total_n_feature_nodes, feat_dim
+            total_feat_fetch_s,
+            total_n_feature_nodes,
+            feat_dim,
+            wall_s=wall_s,
+            ssd_read_ops=n_ssd,
+            page_size=ps if n_ssd is not None else None,
         )
 
 

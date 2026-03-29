@@ -40,6 +40,10 @@ the Python wiring against a matching test dataset)::
     export LD_LIBRARY_PATH=/path/to/LSM-GNN/bam/build/lib:$LD_LIBRARY_PATH
     python train_bam_pyg.py --bam 1 --lsm-build /path/to/lsm_module/build
 
+With ``--bam 1``, ``Data.x`` is replaced by a **slim** zero-column tensor so
+``NeighborLoader`` does not copy full embeddings to each batch; only
+``fetch_feature`` supplies features.
+
 Note: ``gids_training.py`` relies on a **custom DGL DataLoader** (``bam=…``,
 ``bam_init``) in your DGL build. This directory uses **plain PyG**
 ``NeighborLoader`` and calls **GIDS** directly for features instead.
@@ -68,6 +72,8 @@ except ImportError:
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.normpath(os.path.join(_HERE, "..", ".."))
+
+from pyg_loader_skip_features import data_without_dense_node_features
 
 
 def _prepend_path(p: str) -> None:
@@ -136,11 +142,83 @@ def _make_synthetic_data(num_nodes: int, feat_dim: int, num_classes: int, seed: 
     return data
 
 
-def train_epoch(loader, model, optimizer, device, use_bam: bool, gids, feat_dim: int):
+def print_bam_feature_fetch_summary(
+    feat_agg_s: float,
+    n_feat_nodes: int,
+    feat_dim: int,
+    prefix: str = "",
+    *,
+    wall_s: float | None = None,
+    ssd_read_ops: int | None = None,
+    page_size: int | None = None,
+) -> None:
+    """
+    Print GIDS / loader feature timing and effective feature GB/s (decimal GB = 1e9 bytes).
+
+    If ``wall_s`` is set, prints two lines: times (e2e, feature aggregation, remainder as
+    model training), then counts and bandwidths. Optional ``ssd_read_ops`` and ``page_size``
+    add ``ssd_bandwidth = (ssd_read_ops * page_size) / feat_agg_s`` in GB/s.
+    """
+    if n_feat_nodes <= 0 or feat_agg_s <= 0:
+        print(f"{prefix}BAM feature fetch: no samples or zero time.")
+        return
+    bytes_moved = float(n_feat_nodes * feat_dim * 4)
+    feat_gbps = (bytes_moved / 1e9) / feat_agg_s
+
+    if wall_s is not None:
+        wall_f = float(wall_s)
+        model_s = max(0.0, wall_f - float(feat_agg_s))
+        print(
+            f"{prefix}BAM times: end_to_end={wall_f:.4f}s  "
+            f"feature_aggregation={float(feat_agg_s):.4f}s  "
+            f"model_training={model_s:.4f}s"
+        )
+        line2 = (
+            f"{prefix}BAM data: feature_nodes={n_feat_nodes}  feat_dim={feat_dim}  "
+            f"effective_bandwidth={feat_gbps:.3f} GB/s"
+        )
+        if ssd_read_ops is not None and page_size is not None:
+            ssd_bytes = float(ssd_read_ops) * float(page_size)
+            ssd_gbps = (ssd_bytes / 1e9) / float(feat_agg_s)
+            line2 += (
+                f"  ssd_read_ops={int(ssd_read_ops)}  "
+                f"ssd_bandwidth={ssd_gbps:.3f} GB/s"
+            )
+        print(line2)
+        return
+
+    print(
+        f"{prefix}BAM feature aggregation: time={feat_agg_s:.4f}s  "
+        f"feature_nodes={n_feat_nodes}  feat_dim={feat_dim}  "
+        f"effective_bandwidth={feat_gbps:.3f} GB/s"
+    )
+
+
+def train_epoch(
+    loader,
+    model,
+    optimizer,
+    device,
+    use_bam: bool,
+    gids,
+    feat_dim: int,
+    *,
+    bam_features_from_loader: bool = False,
+    max_batches: int | None = None,
+):
+    """Returns (mean_loss, feat_fetch_seconds, n_feature_nodes, n_batches) for BAM timing.
+
+    If ``bam_features_from_loader`` is True (e.g. ``LSM_GNN_Neighbor_Loader`` already
+    filled ``batch.x`` via ``GIDS``), skip ``fetch_feature`` here; aggregate fetch
+    timing should be recorded in the loader's ``feature_fn`` instead.
+    """
     model.train()
     total_loss = 0.0
     n = 0
-    for batch in loader:
+    feat_fetch_s = 0.0
+    n_feature_nodes = 0
+    n_batches = 0
+    for i, batch in enumerate(loader):
         batch = batch.to(device)
         optimizer.zero_grad()
         if use_bam:
@@ -148,8 +226,21 @@ def train_epoch(loader, model, optimizer, device, use_bam: bool, gids, feat_dim:
                 raise RuntimeError(
                     "Batch missing n_id; use a recent PyG NeighborLoader for BAM gathers."
                 )
-            idx = batch.n_id.to(device, dtype=torch.long)
-            x = gids.fetch_feature(idx, feat_dim)
+            if bam_features_from_loader:
+                x = batch.x
+                if x is None or x.dim() != 2 or x.size(1) != feat_dim:
+                    raise RuntimeError(
+                        "Expected batch.x from loader feature_fn with shape "
+                        f"[..., {feat_dim}], got {None if x is None else tuple(x.shape)}"
+                    )
+            else:
+                idx = batch.n_id.to(device, dtype=torch.long)
+                t0 = time.perf_counter()
+                x = gids.fetch_feature(idx, feat_dim)
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                feat_fetch_s += time.perf_counter() - t0
+                n_feature_nodes += int(idx.numel())
         else:
             x = batch.x
         logits = model(x, batch.edge_index)[: batch.batch_size]
@@ -159,19 +250,42 @@ def train_epoch(loader, model, optimizer, device, use_bam: bool, gids, feat_dim:
         optimizer.step()
         total_loss += float(loss) * batch.batch_size
         n += batch.batch_size
-    return total_loss / max(n, 1)
+        n_batches = i + 1
+        if max_batches is not None and (i + 1) >= max_batches:
+            break
+    return total_loss / max(n, 1), feat_fetch_s, n_feature_nodes, n_batches
 
 
 @torch.no_grad()
-def eval_epoch(loader, model, device, use_bam: bool, gids, feat_dim: int):
+def eval_epoch(
+    loader,
+    model,
+    device,
+    use_bam: bool,
+    gids,
+    feat_dim: int,
+    *,
+    bam_features_from_loader: bool = False,
+    max_batches: int | None = None,
+):
+    """Returns (accuracy_percent, num_batches)."""
     model.eval()
     correct = 0
     tot = 0
-    for batch in loader:
+    n_batches = 0
+    for i, batch in enumerate(loader):
         batch = batch.to(device)
         if use_bam:
-            idx = batch.n_id.to(device, dtype=torch.long)
-            x = gids.fetch_feature(idx, feat_dim)
+            if bam_features_from_loader:
+                x = batch.x
+                if x is None or x.dim() != 2 or x.size(1) != feat_dim:
+                    raise RuntimeError(
+                        "Expected batch.x from loader feature_fn with shape "
+                        f"[..., {feat_dim}], got {None if x is None else tuple(x.shape)}"
+                    )
+            else:
+                idx = batch.n_id.to(device, dtype=torch.long)
+                x = gids.fetch_feature(idx, feat_dim)
         else:
             x = batch.x
         logits = model(x, batch.edge_index)[: batch.batch_size]
@@ -179,26 +293,37 @@ def eval_epoch(loader, model, device, use_bam: bool, gids, feat_dim: int):
         pred = logits.argmax(dim=-1)
         correct += int((pred == y).sum())
         tot += int(y.numel())
-    return 100.0 * correct / max(tot, 1)
+        n_batches = i + 1
+        if max_batches is not None and (i + 1) >= max_batches:
+            break
+    return 100.0 * correct / max(tot, 1), n_batches
 
 
 def train_epoch_fullbatch(data, model, optimizer, device, use_bam: bool, gids, feat_dim: int):
-    """Full-graph forward; no pyg-lib / torch-sparse required."""
+    """Full-graph forward; no pyg-lib / torch-sparse required.
+    Returns (loss, feat_fetch_seconds, n_feature_nodes)."""
     model.train()
     optimizer.zero_grad()
     edge_index = data.edge_index.to(device)
     y = data.y.to(device)
     train_mask = data.train_mask.to(device)
+    feat_fetch_s = 0.0
+    n_feature_nodes = 0
     if use_bam:
         idx = torch.arange(data.num_nodes, device=device, dtype=torch.long)
+        t0 = time.perf_counter()
         x = gids.fetch_feature(idx, feat_dim)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        feat_fetch_s = time.perf_counter() - t0
+        n_feature_nodes = int(idx.numel())
     else:
         x = data.x.to(device)
     logits = model(x, edge_index)
     loss = F.cross_entropy(logits[train_mask], y[train_mask])
     loss.backward()
     optimizer.step()
-    return float(loss.detach())
+    return float(loss.detach()), feat_fetch_s, n_feature_nodes
 
 
 @torch.no_grad()
@@ -301,6 +426,13 @@ def main():
     data = _make_synthetic_data(
         args.num_nodes, args.feat_dim, args.num_classes, seed=args.seed
     )
+    if args.bam:
+        data = data_without_dense_node_features(data)
+        print(
+            f"Slim BAM Data: x shape {tuple(data.x.shape)} (GIDS-only features; "
+            "NeighborLoader skips full-dim x)",
+            flush=True,
+        )
 
     train_loader = val_loader = test_loader = None
     if args.full_batch:
@@ -383,31 +515,50 @@ def main():
 
     use_bam = bool(args.bam)
     t0 = time.time()
+    total_feat_fetch_s = 0.0
+    total_n_feature_nodes = 0
     if args.full_batch:
         for epoch in range(args.epochs):
-            loss = train_epoch_fullbatch(
+            loss, fs, nf = train_epoch_fullbatch(
                 data, model, optimizer, device, use_bam, gids, args.feat_dim
             )
+            total_feat_fetch_s += fs
+            total_n_feature_nodes += nf
             val_acc = eval_fullbatch(
                 data, model, device, use_bam, gids, args.feat_dim, "val_mask"
             )
-            print(f"Epoch {epoch:03d} | loss {loss:.4f} | val acc {val_acc:.2f}%")
+            print(
+                f"Epoch {epoch:03d} | loss {loss:.4f} | val acc {val_acc:.2f}% "
+                f"| train_batches=1 val_batches=1"
+            )
         test_acc = eval_fullbatch(
             data, model, device, use_bam, gids, args.feat_dim, "test_mask"
         )
+        n_te = 1
     else:
         for epoch in range(args.epochs):
-            loss = train_epoch(
+            loss, fs, nf, n_tr = train_epoch(
                 train_loader, model, optimizer, device, use_bam, gids, args.feat_dim
             )
-            val_acc = eval_epoch(
+            total_feat_fetch_s += fs
+            total_n_feature_nodes += nf
+            val_acc, n_va = eval_epoch(
                 val_loader, model, device, use_bam, gids, args.feat_dim
             )
-            print(f"Epoch {epoch:03d} | loss {loss:.4f} | val acc {val_acc:.2f}%")
-        test_acc = eval_epoch(
+            print(
+                f"Epoch {epoch:03d} | loss {loss:.4f} | val acc {val_acc:.2f}% "
+                f"| train_batches={n_tr} val_batches={n_va}"
+            )
+        test_acc, n_te = eval_epoch(
             test_loader, model, device, use_bam, gids, args.feat_dim
         )
-    print(f"Test acc {test_acc:.2f}% | wall {time.time() - t0:.1f}s")
+    print(
+        f"Test acc {test_acc:.2f}% | test_batches={n_te} | wall {time.time() - t0:.1f}s"
+    )
+    if use_bam:
+        print_bam_feature_fetch_summary(
+            total_feat_fetch_s, total_n_feature_nodes, args.feat_dim
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+# PyTorch first: https://pytorch.org/get-started/locally/
+torch>=2.0
+torch-geometric>=2.3
+# NeighborLoader also needs one of:
+#   pip install pyg_lib torch_scatter torch_sparse torch_cluster -f https://data.pyg.org/whl/torch-<ver>+<cpu|cu...>.html
+# (run train_bam_pyg.py without --full-batch to print the exact -f URL), or use --full-batch for small demos.
