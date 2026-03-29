@@ -67,6 +67,29 @@ endif()
 
 find_package(OpenMP)
 
+find_package(CUDAToolkit REQUIRED)
+
+set(LSM_CUCO_ROOT "" CACHE PATH
+  "Path to cuCollections checkout (must contain include/cuco/). If empty, FetchContent downloads a pinned revision.")
+
+include(FetchContent)
+if(LSM_CUCO_ROOT)
+  if(NOT EXISTS "${LSM_CUCO_ROOT}/include/cuco/static_map.cuh")
+    message(FATAL_ERROR "LSM_CUCO_ROOT must contain include/cuco/static_map.cuh: ${LSM_CUCO_ROOT}")
+  endif()
+  set(_lsm_cuco_include "${LSM_CUCO_ROOT}/include")
+else()
+  FetchContent_Declare(
+    lsm_cuco
+    GIT_REPOSITORY https://github.com/NVIDIA/cuCollections.git
+    GIT_TAG d4b2e2a303ef0064acdc6169d2ca926ec1fb5d2e)
+  FetchContent_GetProperties(lsm_cuco)
+  if(NOT lsm_cuco_POPULATED)
+    FetchContent_Populate(lsm_cuco)
+  endif()
+  set(_lsm_cuco_include "${lsm_cuco_SOURCE_DIR}/include")
+endif()
+
 set(LSM_GNN_BAM_ROOT "${CMAKE_CURRENT_LIST_DIR}/../bam" CACHE PATH
   "BAM tree (headers under include/, libnvm under build/)")
 
@@ -130,15 +153,32 @@ set_target_properties(BAM_Feature_Store PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${_lsm_py_pkg}"
   CUDA_ARCHITECTURES "${LSM_CUDA_ARCHITECTURES}")
 
+# cuco/Thrust: separate OBJECT target with C++20 so BAM-facing lsm_nvme.cu stays C++14 (simt chrono + CCCL clash).
+add_library(lsm_nvme_cuco_queue_map OBJECT src/lsm_nvme_queue_map_device.cu)
+target_include_directories(lsm_nvme_cuco_queue_map
+  PRIVATE
+    "${_lsm_cuco_include}"
+    "${CUDAToolkit_INCLUDE_DIRS}")
+target_link_libraries(lsm_nvme_cuco_queue_map PRIVATE CUDA::cudart)
+target_compile_options(lsm_nvme_cuco_queue_map PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+set_target_properties(lsm_nvme_cuco_queue_map PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+  CUDA_ARCHITECTURES "${LSM_CUDA_ARCHITECTURES}"
+  CUDA_STANDARD 20
+  CUDA_STANDARD_REQUIRED ON)
+
 pybind11_add_module(LSM_NVMe MODULE src/lsm_nvme.cu)
 
 target_include_directories(LSM_NVMe
   PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/include"
     "${LSM_GNN_BAM_ROOT}/include"
-    "${LSM_GNN_BAM_ROOT}/include/freestanding/include")
+    "${LSM_GNN_BAM_ROOT}/include/freestanding/include"
+    "${CUDAToolkit_INCLUDE_DIRS}")
 
-target_link_libraries(LSM_NVMe PRIVATE "${NVM_LIBRARY}")
+target_link_libraries(LSM_NVMe PRIVATE "${NVM_LIBRARY}" CUDA::cudart lsm_nvme_cuco_queue_map)
 
 target_compile_options(LSM_NVMe PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)

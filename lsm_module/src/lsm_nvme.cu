@@ -31,6 +31,18 @@ namespace py = pybind11;
 
 using TYPE = LSM_NVME_TYPE;
 
+void lsm_nvme_queue_map_build_impl(LSM_NVMeQueueMapState *st, int cuda_device,
+                                   uint64_t d_node_ids_ptr, uint64_t d_batch_idx_ptr,
+                                   int32_t n, uint64_t map_capacity);
+
+void lsm_nvme_queue_map_index_map_add_impl(LSM_NVMeQueueMapState *st, int cuda_device,
+                                           uint64_t d_node_ids_ptr, int32_t n,
+                                           uint32_t time_step);
+
+void lsm_nvme_queue_map_index_map_remove_impl(LSM_NVMeQueueMapState *st, int cuda_device,
+                                              uint64_t d_node_ids_ptr, int32_t n,
+                                              uint32_t time_step);
+
 template <typename T = TYPE>
 __global__ void read_feature_kernel(array_d_t<T> *dr, T *out_tensor_ptr,
                                     int64_t *index_ptr, int dim,
@@ -92,6 +104,7 @@ __global__ void read_next_reuse_for_pages_kernel(array_d_t<T> *dr,
 }
 
 LSM_NVMeStore::~LSM_NVMeStore() {
+  queue_map_.reset();
   if (is_pvp)
     lsm_gnn::pinned_eviction_buffer_destroy(pinned_eviction_);
   for (auto *c : ctrls)
@@ -250,6 +263,44 @@ uint64_t LSM_NVMeStore::ssd_read_ops_count() const {
   return v;
 }
 
+void LSM_NVMeStore::build_node_queue_index_map(uint64_t d_node_ids_ptr,
+                                               uint64_t d_batch_idx_ptr,
+                                               int32_t n, uint64_t map_capacity,
+                                               uint32_t time_step) {
+  cuda_err_chk(cudaSetDevice(static_cast<int>(cudaDevice)));
+  queue_map_time_step_ = time_step;
+  if (n <= 0 || map_capacity == 0)
+    return;
+
+  if (!queue_map_.get())
+    queue_map_.reset(lsm_nvme_queue_map_state_new());
+
+  lsm_nvme_queue_map_build_impl(queue_map_.get(), static_cast<int>(cudaDevice),
+                                d_node_ids_ptr, d_batch_idx_ptr, n, map_capacity);
+}
+
+void LSM_NVMeStore::index_map_add(uint64_t d_node_ids_ptr, int32_t n,
+                                  uint32_t time_step) {
+  cuda_err_chk(cudaSetDevice(static_cast<int>(cudaDevice)));
+  queue_map_time_step_ = time_step;
+  if (n <= 0 || !queue_map_.get())
+    return;
+
+  lsm_nvme_queue_map_index_map_add_impl(queue_map_.get(), static_cast<int>(cudaDevice),
+                                        d_node_ids_ptr, n, time_step);
+}
+
+void LSM_NVMeStore::index_map_remove(uint64_t d_node_ids_ptr, int32_t n,
+                                     uint32_t time_step) {
+  cuda_err_chk(cudaSetDevice(static_cast<int>(cudaDevice)));
+  queue_map_time_step_ = time_step;
+  if (n <= 0 || !queue_map_.get())
+    return;
+
+  lsm_nvme_queue_map_index_map_remove_impl(queue_map_.get(), static_cast<int>(cudaDevice),
+                                           d_node_ids_ptr, n, time_step);
+}
+
 PYBIND11_MODULE(LSM_NVMe, m) {
   m.doc() = "LSM-GNN NVMe: read_feature + update_prefetch_timestamp";
 
@@ -331,5 +382,21 @@ PYBIND11_MODULE(LSM_NVMe, m) {
            "Copy pinned PVP ring for head (time_step %% num_pvp_buffers) to device_ptr; "
            "size is pvp_queue_depth * page_size bytes.")
       .def("ssd_read_ops_count", &LSM_NVMeStore::ssd_read_ops_count,
-           "Return cumulative NVMe read op count (device atomic on page cache).");
+           "Return cumulative NVMe read op count (device atomic on page cache).")
+      .def_readonly("queue_map_time_step", &LSM_NVMeStore::queue_map_time_step_)
+      .def("build_node_queue_index_map", &LSM_NVMeStore::build_node_queue_index_map,
+           py::arg("d_node_ids_ptr"), py::arg("d_batch_idx_ptr"), py::arg("n"),
+           py::arg("map_capacity"), py::arg("time_step"),
+           "Rebuild reuse map: parallel device arrays length n — node id (int64) and batch index "
+           "(int32). Batch index is 0-based which batch/PVP buffer each row is from "
+           "(batch1→0, batch2→1, …). Value=INT32_MAX if node sees one batch index or only repeats "
+           "of the same index; else second-smallest distinct batch index (smallest is anchor). "
+           "d_* are device pointers as Python int.")
+      .def("index_map_add", &LSM_NVMeStore::index_map_add, py::arg("d_node_ids_ptr"),
+           py::arg("n"), py::arg("time_step"),
+           "In-place map update: new key -> INT32_MAX; value already != INT32_MAX -> unchanged; "
+           "value == INT32_MAX -> set to time_step. Unique batch ids; monotonic time_step.")
+      .def("index_map_remove", &LSM_NVMeStore::index_map_remove, py::arg("d_node_ids_ptr"),
+           py::arg("n"), py::arg("time_step"),
+           "Erase key if present and value is INT32_MAX or equals time_step; else no-op.");
 }

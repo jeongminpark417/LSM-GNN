@@ -40,6 +40,14 @@ from torch_geometric.sampler import HeteroSamplerOutput, SamplerOutput
 from torch_geometric.sampler.base import SubgraphType
 from torch_geometric.typing import EdgeType, InputNodes, OptTensor, TensorFrame
 
+# Signed 32-bit max, matching typical ``uint32_t`` / refresh counter rollover margin vs ``num_buf``.
+_INT32_MAX = 2**31 - 1
+
+
+def _hash_map_refresh_rollover_threshold(num_buf: int) -> int:
+    """``(2**31 - 1) - 1 - num_buf`` — rebuild map and reset :attr:`_hash_map_refresh_time` to 0."""
+    return _INT32_MAX - 1 - int(num_buf)
+
 
 def _filter_node_store_skip_x(store, out_store, index: torch.Tensor) -> None:
     for key, value in store.items():
@@ -70,6 +78,77 @@ def filter_data_without_x(
     _filter_node_store_skip_x(data._store, out._store, node)
     filter_edge_store_(data._store, out._store, row, col, edge, perm)
     return out
+
+
+def _neighbor_sampling_layers_product(
+    num_neighbors: Union[List[int], Dict[EdgeType, List[int]]],
+) -> int:
+    """
+    Product of per-hop neighbor counts, e.g. ``[10, 10] -> 100``.
+    For heterogeneous configs, use the maximum product over edge types.
+    """
+    if isinstance(num_neighbors, dict):
+        best = 1
+        for layers in num_neighbors.values():
+            p = 1
+            for x in layers:
+                p *= int(x)
+            best = max(best, p)
+        return max(best, 1)
+    p = 1
+    for x in num_neighbors:
+        p *= int(x)
+    return max(p, 1)
+
+
+def _build_node_queue_index_map_from_queue(
+    loader: "LSM_GNN_Neighbor_Loader",
+    queue: deque[Any],
+) -> None:
+    """
+    Rebuild internal node reuse map from the raw PVP lookahead ``queue`` (see C++ docs:
+    single batch index → INT32_MAX; reused across batches → second-smallest distinct batch index).
+    Uses :attr:`LSM_GNN_Neighbor_Loader._hash_map_refresh_time` as the C++ ``time_step``.
+    Invoked once after warmup fill, and again when ``_hash_map_refresh_time`` reaches
+    ``(2**31 - 1) - 1 - num_buf`` (then the loader resets the counter to 0).
+    """
+    if loader._lsm_nvme is None or not loader._pvp_batch_prefetch:
+        return
+    if not queue:
+        return
+    dev = loader._lsm_nvme_device
+    if dev is None or dev.type != "cuda":
+        return
+    parts_id: List[torch.Tensor] = []
+    parts_q: List[torch.Tensor] = []
+    for qi, raw in enumerate(queue):
+        if not isinstance(raw, SamplerOutput):
+            return
+        nodes = raw.node.to(device=dev, dtype=torch.int64).reshape(-1)
+        if nodes.numel() == 0:
+            continue
+        parts_id.append(nodes)
+        parts_q.append(
+            torch.full((nodes.numel(),), qi, device=dev, dtype=torch.int32)
+        )
+    if not parts_id:
+        return
+    node_ids = torch.cat(parts_id)
+    batch_idx = torch.cat(parts_q)
+    n = int(node_ids.numel())
+    bs = int(loader.batch_size or 0)
+    num_buf = int(loader._pvp_batch_queue_size)
+    fanout = int(loader._lsm_neighbor_layers_product)
+    map_cap = max(n, max(bs * fanout * num_buf, 1))
+    ts = int(loader._hash_map_refresh_time) & 0xFFFFFFFF
+    t0 = time.perf_counter()
+    loader._lsm_nvme.build_node_queue_index_map(node_ids, batch_idx, map_cap, ts)
+    torch.cuda.synchronize(dev)
+    elapsed = time.perf_counter() - t0
+    stats = loader._lsm_nvme_timing_stats
+    if stats is not None:
+        stats["queue_map_s"] = float(stats.get("queue_map_s", 0.0)) + elapsed
+        stats["queue_map_n"] = int(stats.get("queue_map_n", 0)) + 1
 
 
 def _eff_num_batches(loader: "LSM_GNN_Neighbor_Loader", base_len: int) -> int:
@@ -208,6 +287,8 @@ class _PvpBatchPrefetchRawIterator:
                 except StopIteration:
                     break
             self._warmup_done = True
+            _build_node_queue_index_map_from_queue(self._loader, self._queue)
+            self._loader._hash_map_refresh_time += 1
 
         if not self._queue:
             raise StopIteration
@@ -218,6 +299,12 @@ class _PvpBatchPrefetchRawIterator:
 
         if self._pulls_done < self._eff_total:
             try:
+                nb = int(self._loader._pvp_batch_queue_size)
+                thr = _hash_map_refresh_rollover_threshold(nb)
+                self._loader._hash_map_refresh_time += 1
+                if self._loader._hash_map_refresh_time >= thr:
+                    _build_node_queue_index_map_from_queue(self._loader, self._queue)
+                    self._loader._hash_map_refresh_time = 0
                 self._queue.append(next(self._base))
                 self._pulls_done += 1
             except StopIteration:
@@ -285,6 +372,8 @@ class LSM_GNN_Neighbor_Loader(NeighborLoader):
         self._pvp_batch_prefetch = bool(pvp_batch_prefetch)
         self._pvp_batch_queue_size = int(num_pvp_buffers)
         self._last_tail_batch = False
+        self._lsm_neighbor_layers_product = _neighbor_sampling_layers_product(num_neighbors)
+        self._hash_map_refresh_time: int = 0
 
         self._pvp_staging_buffer: Optional[torch.Tensor] = None
         self._pvp_time_step: int = 0
@@ -325,6 +414,7 @@ class LSM_GNN_Neighbor_Loader(NeighborLoader):
     def _pvp_reset_time_step_for_iterator(self) -> None:
         if self._pvp_staging_buffer is not None:
             self._pvp_time_step = 0
+        self._hash_map_refresh_time = 0
 
     def _raw_dataloader_iterator(self):
         return super(NodeLoader, self)._get_iterator()

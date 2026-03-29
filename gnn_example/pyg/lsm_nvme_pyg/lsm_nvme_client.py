@@ -204,3 +204,69 @@ class LSM_NVMeFeatureClient:
         if not dst.is_contiguous():
             raise ValueError("pvp_prefetch expects a contiguous tensor")
         self._store.PVP_prefetch(dst.data_ptr(), int(time_step) & 0xFFFFFFFF)
+
+    def build_node_queue_index_map(
+        self,
+        node_ids: torch.Tensor,
+        batch_idx: torch.Tensor,
+        map_capacity: int,
+        time_step: int,
+    ) -> None:
+        """
+        Clear and rebuild the internal reuse map on GPU: key = node id (int64, id < 0 skipped).
+
+        ``batch_idx`` (int32, same length as ``node_ids``) is the **0-based batch index** for each
+        row: which lookahead batch / PVP buffer the row belongs to (first batch → 0, second → 1,
+        …). Concatenate batches in order so every row from batch ``k`` uses ``batch_idx == k``.
+
+        Map value = ``INT32_MAX`` if the node only appears with one distinct batch index (or only
+        repeats the same index); if it appears across multiple batch indices, the value is the
+        second-smallest distinct batch index (the smallest is the anchor).
+
+        ``map_capacity`` should bound the number of distinct node ids.
+        """
+        if node_ids.device.type != "cuda" or batch_idx.device.type != "cuda":
+            raise ValueError("build_node_queue_index_map expects CUDA tensors")
+        if int(node_ids.numel()) != int(batch_idx.numel()):
+            raise ValueError("node_ids and batch_idx must have the same length")
+        node_ids = node_ids.reshape(-1).contiguous()
+        batch_idx = batch_idx.reshape(-1).contiguous()
+        self._store.build_node_queue_index_map(
+            int(node_ids.data_ptr()),
+            int(batch_idx.data_ptr()),
+            int(node_ids.numel()),
+            int(map_capacity),
+            int(time_step) & 0xFFFFFFFF,
+        )
+
+    def index_map_add(self, node_ids: torch.Tensor, time_step: int) -> None:
+        """
+        In-place update of the internal reuse map (must call ``build_node_queue_index_map`` first).
+        For each node id (int64 on CUDA, ``id < 0`` skipped): absent → insert ``INT32_MAX``;
+        present with value ≠ ``INT32_MAX`` → unchanged; present with ``INT32_MAX`` → set to
+        ``time_step`` (second touch). Batch ids should be unique; ``time_step`` should increase
+        across calls.
+        """
+        if node_ids.device.type != "cuda":
+            raise ValueError("index_map_add expects a CUDA tensor")
+        node_ids = node_ids.reshape(-1).contiguous()
+        self._store.index_map_add(
+            int(node_ids.data_ptr()),
+            int(node_ids.numel()),
+            int(time_step) & 0xFFFFFFFF,
+        )
+
+    def index_map_remove(self, node_ids: torch.Tensor, time_step: int) -> None:
+        """
+        In-place removals on the internal reuse map. For each node id (CUDA int64, ``id < 0``
+        skipped): missing key → no-op; value is ``INT32_MAX`` or equals ``time_step`` → erase;
+        otherwise no-op.
+        """
+        if node_ids.device.type != "cuda":
+            raise ValueError("index_map_remove expects a CUDA tensor")
+        node_ids = node_ids.reshape(-1).contiguous()
+        self._store.index_map_remove(
+            int(node_ids.data_ptr()),
+            int(node_ids.numel()),
+            int(time_step) & 0xFFFFFFFF,
+        )

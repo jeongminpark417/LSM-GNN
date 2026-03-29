@@ -151,6 +151,8 @@ def print_bam_feature_fetch_summary(
     wall_s: float | None = None,
     ssd_read_ops: int | None = None,
     page_size: int | None = None,
+    queue_map_total_s: float | None = None,
+    queue_map_calls: int | None = None,
 ) -> None:
     """
     Print GIDS / loader feature timing and effective feature GB/s (decimal GB = 1e9 bytes).
@@ -158,9 +160,25 @@ def print_bam_feature_fetch_summary(
     If ``wall_s`` is set, prints two lines: times (e2e, feature aggregation, remainder as
     model training), then counts and bandwidths. Optional ``ssd_read_ops`` and ``page_size``
     add ``ssd_bandwidth = (ssd_read_ops * page_size) / feat_agg_s`` in GB/s.
+
+    Optional ``queue_map_total_s`` / ``queue_map_calls`` print PVP cuco queue-index map timing.
     """
+
+    def _print_queue_map_line() -> None:
+        if queue_map_calls is None or queue_map_total_s is None:
+            return
+        qc = int(queue_map_calls)
+        if qc <= 0:
+            return
+        qs = float(queue_map_total_s)
+        print(
+            f"{prefix}BAM queue_index_map: total_time={qs:.4f}s  calls={qc}  "
+            f"avg_per_call={qs / qc:.6f}s"
+        )
+
     if n_feat_nodes <= 0 or feat_agg_s <= 0:
         print(f"{prefix}BAM feature fetch: no samples or zero time.")
+        _print_queue_map_line()
         return
     bytes_moved = float(n_feat_nodes * feat_dim * 4)
     feat_gbps = (bytes_moved / 1e9) / feat_agg_s
@@ -185,6 +203,7 @@ def print_bam_feature_fetch_summary(
                 f"ssd_bandwidth={ssd_gbps:.3f} GB/s"
             )
         print(line2)
+        _print_queue_map_line()
         return
 
     print(
@@ -192,6 +211,7 @@ def print_bam_feature_fetch_summary(
         f"feature_nodes={n_feat_nodes}  feat_dim={feat_dim}  "
         f"effective_bandwidth={feat_gbps:.3f} GB/s"
     )
+    _print_queue_map_line()
 
 
 def train_epoch(

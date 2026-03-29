@@ -313,7 +313,7 @@ def main():
             if gids is None:
                 print("error: --bam 1 but LSM_NVMe client failed to initialize.", file=sys.stderr)
                 sys.exit(1)
-            bam_feat_stats = {"s": 0.0, "n": 0}
+            bam_feat_stats = {"s": 0.0, "n": 0, "queue_map_s": 0.0, "queue_map_n": 0}
             bam_loader_kw = {
                 "lsm_nvme": gids,
                 "lsm_nvme_feat_dim": feat_dim,
@@ -363,6 +363,8 @@ def main():
     t0 = time.time()
     total_feat_fetch_s = 0.0
     total_n_feature_nodes = 0
+    total_queue_map_s = 0.0
+    total_queue_map_calls = 0
     if args.full_batch:
         for epoch in range(args.epochs):
             loss, fs, nf = train_epoch_fullbatch(
@@ -386,6 +388,8 @@ def main():
             if bam_feat_stats is not None:
                 bam_feat_stats["s"] = 0.0
                 bam_feat_stats["n"] = 0
+                bam_feat_stats["queue_map_s"] = 0.0
+                bam_feat_stats["queue_map_n"] = 0
             loss, fs, nf, n_tr = train_epoch(
                 train_loader,
                 model,
@@ -400,6 +404,8 @@ def main():
             if use_bam and bam_feat_stats is not None:
                 total_feat_fetch_s += float(bam_feat_stats["s"])
                 total_n_feature_nodes += int(bam_feat_stats["n"])
+                total_queue_map_s += float(bam_feat_stats.get("queue_map_s", 0.0))
+                total_queue_map_calls += int(bam_feat_stats.get("queue_map_n", 0))
             else:
                 total_feat_fetch_s += fs
                 total_n_feature_nodes += nf
@@ -441,6 +447,8 @@ def main():
             wall_s=wall_s,
             ssd_read_ops=n_ssd,
             page_size=ps if n_ssd is not None else None,
+            queue_map_total_s=total_queue_map_s,
+            queue_map_calls=total_queue_map_calls,
         )
 
 
